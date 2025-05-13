@@ -219,9 +219,7 @@
   )
 )
 
-;; ============================================================
 ;; ===================== SKILLS MODULE =======================
-;; ============================================================
 
 ;; NFT counter
 (define-data-var next-skill-id uint u0)
@@ -552,6 +550,300 @@
       (update-reputation-internal seller u1)
       
       (ok true)
+    )
+  )
+)
+
+;; Helper function to get token balance
+(define-private (get-token-balance-internal (token-id (string-utf8 36)) (owner principal))
+  (default-to u0 
+    (get balance 
+      (default-to { balance: u0 } 
+        (map-get? token-balances { token-id: token-id, owner: owner })
+      )
+    )
+  )
+)
+
+;; Get token balance (public function)
+(define-read-only (get-token-balance (token-id (string-utf8 36)) (owner principal))
+  (ok { balance: (get-token-balance-internal token-id owner) })
+)
+
+;; Get token details
+(define-read-only (get-token-details (token-id (string-utf8 36)))
+  (let ((token-data (map-get? career-tokens { token-id: token-id })))
+    (if (is-some token-data)
+      (ok (unwrap-panic token-data))
+      err-not-found
+    )
+  )
+)
+
+;; Transfer tokens between users
+(define-public (transfer-tokens
+  (token-id (string-utf8 36))
+  (amount uint)
+  (recipient principal)
+)
+  (let ((sender tx-sender)
+        (sender-balance (get-token-balance-internal token-id sender)))
+    
+    ;; Check if sender has enough tokens
+    (asserts! (>= sender-balance amount) err-insufficient-funds)
+    
+    ;; Update sender's balance
+    (map-set token-balances
+      { token-id: token-id, owner: sender }
+      { balance: (- sender-balance amount) }
+    )
+    
+    ;; Update recipient's balance
+    (let ((recipient-balance (get-token-balance-internal token-id recipient)))
+      (map-set token-balances
+        { token-id: token-id, owner: recipient }
+        { balance: (+ recipient-balance amount) }
+      )
+    )
+    
+    (ok true)
+  )
+)
+
+;; ============================================================
+;; =================== MARKETPLACE MODULE ====================
+;; ============================================================
+
+;; Job listing counter
+(define-data-var next-job-id uint u0)
+
+;; Job listings
+(define-map job-listings
+  { job-id: (string-utf8 36) }
+  {
+    creator: principal,
+    title: (string-utf8 100),
+    description: (string-utf8 1000),
+    payment: uint,
+    required-skills: (list 10 (string-utf8 36)),
+    deadline: uint,
+    status: (string-ascii 20), ;; "open", "in-progress", "completed", "cancelled"
+    assignee: (optional principal),
+    creation-time: uint
+  }
+)
+
+;; Job applications
+(define-map job-applications
+  { job-id: (string-utf8 36), applicant: principal }
+  {
+    application-time: uint,
+    notes: (optional (string-utf8 500))
+  }
+)
+
+;; Create a new job listing
+(define-public (create-job
+  (title (string-utf8 100))
+  (description (string-utf8 1000))
+  (payment uint)
+  (required-skills (list 10 (string-utf8 36)))
+  (deadline uint)
+)
+  (let ((creator tx-sender)
+        (job-id (concat "job-" (to-string (var-get next-job-id))))
+        (current-time (get-block-info? time (- block-height u1))))
+    
+    ;; Get the listing fee
+    (let ((listing-fee (var-get minting-fee)))
+      
+      ;; Charge listing fee
+      (try! (stx-transfer? listing-fee tx-sender contract-owner))
+      
+      ;; Send fee to treasury
+      (try! (collect-fee listing-fee))
+      
+      ;; Create the job listing
+      (map-set job-listings
+        { job-id: job-id }
+        {
+          creator: creator,
+          title: title,
+          description: description,
+          payment: payment,
+          required-skills: required-skills,
+          deadline: deadline,
+          status: "open",
+          assignee: none,
+          creation-time: (default-to u0 current-time)
+        }
+      )
+      
+      ;; Increment the job counter
+      (var-set next-job-id (+ (var-get next-job-id) u1))
+      
+      ;; Return the new job ID
+      (ok job-id)
+    )
+  )
+)
+
+;; Apply for a job
+(define-public (apply-for-job
+  (job-id (string-utf8 36))
+  (notes (optional (string-utf8 500)))
+)
+  (let ((applicant tx-sender)
+        (current-time (get-block-info? time (- block-height u1)))
+        (job-data (unwrap! (map-get? job-listings { job-id: job-id }) err-not-found)))
+    
+    ;; Check if job is still open
+    (asserts! (is-eq (get status job-data) "open") err-unauthorized)
+    
+    ;; Check if deadline has passed
+    (asserts! (< (default-to u0 current-time) (get deadline job-data)) err-unauthorized)
+    
+    ;; Record the application
+    (map-set job-applications
+      { job-id: job-id, applicant: applicant }
+      {
+        application-time: (default-to u0 current-time),
+        notes: notes
+      }
+    )
+    
+    (ok true)
+  )
+)
+
+;; Assign a job to an applicant
+(define-public (assign-job
+  (job-id (string-utf8 36))
+  (assignee principal)
+)
+  (let ((creator tx-sender)
+        (job-data (unwrap! (map-get? job-listings { job-id: job-id }) err-not-found)))
+    
+    ;; Check if sender is the job creator
+    (asserts! (is-eq creator (get creator job-data)) err-unauthorized)
+    
+    ;; Check if job is still open
+    (asserts! (is-eq (get status job-data) "open") err-unauthorized)
+    
+    ;; Check if the assignee has applied
+    (asserts! (is-some (map-get? job-applications { job-id: job-id, applicant: assignee })) err-unauthorized)
+    
+    ;; Update job status
+    (map-set job-listings
+      { job-id: job-id }
+      (merge job-data 
+        { 
+          status: "in-progress",
+          assignee: (some assignee)
+        }
+      )
+    )
+    
+    (ok true)
+  )
+)
+
+;; Mark a job as completed (by assignee)
+(define-public (complete-job-work
+  (job-id (string-utf8 36))
+)
+  (let ((assignee tx-sender)
+        (job-data (unwrap! (map-get? job-listings { job-id: job-id }) err-not-found)))
+    
+    ;; Check if sender is the assignee
+    (asserts! (is-eq (some assignee) (get assignee job-data)) err-unauthorized)
+    
+    ;; Check if job is in progress
+    (asserts! (is-eq (get status job-data) "in-progress") err-unauthorized)
+    
+    ;; Update job status to completed-pending
+    (map-set job-listings
+      { job-id: job-id }
+      (merge job-data { status: "completed-pending" })
+    )
+    
+    (ok true)
+  )
+)
+
+;; Confirm job completion and release payment
+(define-public (confirm-job-completion
+  (job-id (string-utf8 36))
+)
+  (let ((creator tx-sender)
+        (job-data (unwrap! (map-get? job-listings { job-id: job-id }) err-not-found)))
+    
+    ;; Check if sender is the job creator
+    (asserts! (is-eq creator (get creator job-data)) err-unauthorized)
+    
+    ;; Check if job is in completed-pending status
+    (asserts! (is-eq (get status job-data) "completed-pending") err-unauthorized)
+    
+    ;; Get assignee
+    (let ((assignee (unwrap! (get assignee job-data) err-not-found))
+          (payment (get payment job-data))
+          (fee (* payment (/ (var-get transaction-fee-percent) u100)))
+          (payment-after-fee (- payment fee)))
+    
+      ;; Transfer payment from creator to assignee
+      (try! (stx-transfer? payment-after-fee creator assignee))
+      
+      ;; Transfer fee to contract
+      (try! (stx-transfer? fee creator contract-owner))
+      
+      ;; Send fee to treasury
+      (try! (collect-fee fee))
+      
+      ;; Update job status
+      (map-set job-listings
+        { job-id: job-id }
+        (merge job-data { status: "completed" })
+      )
+      
+      ;; Increase reputation for both parties
+      (update-reputation-internal creator u1)
+      (update-reputation-internal assignee u2)
+      
+      (ok true)
+    )
+  )
+)
+
+;; Get job details
+(define-read-only (get-job-details (job-id (string-utf8 36)))
+  (let ((job-data (map-get? job-listings { job-id: job-id })))
+    (if (is-some job-data)
+      (ok (unwrap-panic job-data))
+      err-not-found
+    )
+  )
+)
+
+;; Get all jobs created by a user
+(define-read-only (get-user-created-jobs (user principal))
+  (ok (filter created-by-user (map-keys job-listings)))
+  
+  ;; Helper function to check if a job was created by the user
+  (define-private (created-by-user (job-key { job-id: (string-utf8 36) }))
+    (let ((job-data (unwrap! (map-get? job-listings job-key) false)))
+      (is-eq (get creator job-data) user)
+    )
+  )
+)
+
+;; Get all jobs assigned to a user
+(define-read-only (get-user-assigned-jobs (user principal))
+  (ok (filter assigned-to-user (map-keys job-listings)))
+  
+  ;; Helper function to check if a job is assigned to the user
+  (define-private (assigned-to-user (job-key { job-id: (string-utf8 36) }))
+    (let ((job-data (unwrap! (map-get? job-listings job-key) false)))
+      (is-eq (get assignee job-data) (some user))
     )
   )
 )
